@@ -266,17 +266,20 @@ class ExcelStructureAnalyzer:
         """Detect table structures in the sheet"""
         tables = []
         
-        # Find potential header rows (rows with mostly text)
+        # Find potential header rows (rows with mostly text or mixed content)
         header_candidates = []
         
-        for row in range(1, min(21, max_row + 1)):  # Check first 20 rows
+        for row in range(1, min(31, max_row + 1)):  # Check first 30 rows
             row_cells = [cell for addr, cell in all_cells.items() 
                         if self._get_row_from_address(addr) == row]
             
-            if len(row_cells) >= 3:  # Need at least 3 cells
+            if len(row_cells) >= 2:  # Need at least 2 cells
+                # More flexible header detection
                 text_ratio = sum(1 for cell in row_cells if cell.data_type == 'text') / len(row_cells)
+                mixed_ratio = sum(1 for cell in row_cells if cell.data_type in ['text', 'number']) / len(row_cells)
                 
-                if text_ratio >= 0.6:  # 60% or more text cells
+                # Accept rows with good text content or mixed content
+                if text_ratio >= 0.4 or (mixed_ratio >= 0.7 and text_ratio >= 0.2):
                     header_candidates.append(row)
         
         # For each header candidate, try to find the associated data table
@@ -284,6 +287,49 @@ class ExcelStructureAnalyzer:
             table = self._extract_table_from_header(all_cells, header_row, max_row, max_col)
             if table:
                 tables.append(table)
+        
+        # If no tables detected, try alternative detection methods
+        if not tables:
+            tables = self._detect_tables_alternative(all_cells, max_row, max_col)
+        
+        return tables
+    
+    def _detect_tables_alternative(self, all_cells: Dict[str, CellData], max_row: int, max_col: int) -> List[TableStructure]:
+        """Alternative table detection when primary method fails"""
+        tables = []
+        
+        # Look for patterns of numeric data with text labels
+        for row in range(1, min(51, max_row + 1)):
+            row_cells = [cell for addr, cell in all_cells.items() 
+                        if self._get_row_from_address(addr) == row]
+            
+            if len(row_cells) >= 3:
+                # Check if this row has a text label followed by numeric data
+                first_cell = row_cells[0]
+                if first_cell.data_type == 'text' and first_cell.value:
+                    # Look for numeric data in subsequent columns
+                    numeric_count = 0
+                    start_col = self._get_col_from_address(first_cell.address)
+                    
+                    for col in range(start_col + 1, min(start_col + 20, max_col + 1)):
+                        addr = f"{chr(64 + col)}{row}"
+                        if addr in all_cells and all_cells[addr].data_type == 'number':
+                            numeric_count += 1
+                    
+                    if numeric_count >= 2:  # At least 2 numeric columns
+                        # Create a simple table structure
+                        table = TableStructure(
+                            name=f"SimpleTable_{row}_{start_col}",
+                            start_row=row,
+                            start_col=start_col,
+                            end_row=row,
+                            end_col=start_col + numeric_count,
+                            headers_row=None,  # No separate header row
+                            data_rows=[row],
+                            data_cols=list(range(start_col, start_col + numeric_count + 1)),
+                            table_type='simple_data'
+                        )
+                        tables.append(table)
         
         return tables
     
@@ -459,6 +505,15 @@ class ExcelStructureAnalyzer:
         for char in col_letters:
             col_num = col_num * 26 + (ord(char) - ord('A') + 1)
         return col_num
+    
+    def _format_financial_value(self, value: float) -> str:
+        """Format financial values in a readable way"""
+        if abs(value) >= 1_000_000:
+            return f"${value/1_000_000:.1f}M"
+        elif abs(value) >= 1_000:
+            return f"${value/1_000:.1f}K"
+        else:
+            return f"${value:.0f}"
 
 class IntelligentQueryProcessor:
     """Processes natural language queries against Excel data"""
@@ -646,7 +701,67 @@ class IntelligentQueryProcessor:
             if table_data:
                 extracted_data['tables'].append(table_data)
         
+        # If no data found through normal methods, try fallback extraction
+        if not extracted_data['data_points'] and not extracted_data['tables']:
+            fallback_data = self._extract_data_fallback(ws, query_components)
+            if fallback_data:
+                extracted_data.update(fallback_data)
+        
         return extracted_data if (extracted_data['data_points'] or extracted_data['tables']) else None
+    
+    def _extract_data_fallback(self, ws, query_components: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        """Fallback method to extract data when normal methods fail"""
+        fallback_data = {
+            'data_points': [],
+            'tables': []
+        }
+        
+        # Scan the entire sheet for relevant data
+        for row in range(1, ws.max_row + 1):
+            for col in range(1, ws.max_column + 1):
+                cell = ws.cell(row, col)
+                
+                if cell.value and isinstance(cell.value, str):
+                    cell_text = str(cell.value).lower()
+                    
+                    # Check if this cell contains any of the metrics we're looking for
+                    for metric in query_components['metrics']:
+                        if self._text_similarity(metric, cell_text) > 0.3:  # Very low threshold
+                            # Found a metric row, look for numeric data in the same row
+                            for data_col in range(col + 1, min(col + 20, ws.max_column + 1)):
+                                data_cell = ws.cell(row, data_col)
+                                if data_cell.value and isinstance(data_cell.value, (int, float)):
+                                    fallback_data['data_points'].append({
+                                        'row': row,
+                                        'col': data_col,
+                                        'value': data_cell.value,
+                                        'row_label': cell_text,
+                                        'col_label': f"Column {data_col}"
+                                    })
+        
+        # Also try to find time-based data
+        for col in range(1, ws.max_column + 1):
+            header_cell = ws.cell(1, col)
+            if header_cell.value and isinstance(header_cell.value, str):
+                header_text = str(header_cell.value).lower()
+                
+                # Check if this column represents a time period
+                if any(period in header_text for period in ['2022', '2023', '2024', 'jan', 'feb', 'mar', 'apr', 'may', 'jun', 'jul', 'aug', 'sep', 'oct', 'nov', 'dec']):
+                    # Found a time column, look for numeric data
+                    for row in range(2, min(50, ws.max_row + 1)):
+                        data_cell = ws.cell(row, col)
+                        if data_cell.value and isinstance(data_cell.value, (int, float)):
+                            # Try to get row label
+                            row_label = self._get_row_label(ws, row)
+                            fallback_data['data_points'].append({
+                                'row': row,
+                                'col': col,
+                                'value': data_cell.value,
+                                'row_label': row_label,
+                                'col_label': header_text
+                            })
+        
+        return fallback_data if fallback_data['data_points'] else None
     
     def _find_matching_rows(self, ws, metric: str) -> List[int]:
         """Find rows that match the metric"""
@@ -654,12 +769,27 @@ class IntelligentQueryProcessor:
         
         for row in range(1, ws.max_row + 1):
             # Check first few columns for row labels
-            for col in range(1, min(6, ws.max_column + 1)):
+            for col in range(1, min(8, ws.max_column + 1)):  # Check more columns
                 cell = ws.cell(row, col)
                 if cell.value and isinstance(cell.value, str):
-                    if self._text_similarity(metric, cell.value) > 0.6:
+                    similarity = self._text_similarity(metric, cell.value)
+                    if similarity > 0.4:  # Lower threshold for better matching
                         matching_rows.append(row)
                         break
+        
+        # If no matches found with lower threshold, try fuzzy matching
+        if not matching_rows:
+            for row in range(1, ws.max_row + 1):
+                for col in range(1, min(8, ws.max_column + 1)):
+                    cell = ws.cell(row, col)
+                    if cell.value and isinstance(cell.value, str):
+                        cell_text = str(cell.value).lower()
+                        metric_lower = metric.lower()
+                        
+                        # Check for partial matches
+                        if any(word in cell_text for word in metric_lower.split()):
+                            matching_rows.append(row)
+                            break
         
         return matching_rows
     
@@ -668,14 +798,57 @@ class IntelligentQueryProcessor:
         matching_cols = []
         
         # Check first few rows for column headers
-        for row in range(1, min(6, ws.max_row + 1)):
+        for row in range(1, min(8, ws.max_row + 1)):  # Check more rows
             for col in range(1, ws.max_column + 1):
                 cell = ws.cell(row, col)
                 if cell.value and isinstance(cell.value, str):
-                    if period.lower() in cell.value.lower():
+                    cell_text = str(cell.value).lower()
+                    period_lower = period.lower()
+                    
+                    # Direct match
+                    if period_lower in cell_text:
                         matching_cols.append(col)
+                    # Month abbreviations
+                    elif any(month in cell_text for month in ['jan', 'feb', 'mar', 'apr', 'may', 'jun', 'jul', 'aug', 'sep', 'oct', 'nov', 'dec']):
+                        if period_lower in ['2022', '2023', '2024'] or any(year in cell_text for year in ['2022', '2023', '2024']):
+                            matching_cols.append(col)
+                    # Year patterns
+                    elif any(year in cell_text for year in ['2020', '2021', '2022', '2023', '2024']):
+                        if period_lower in cell_text:
+                            matching_cols.append(col)
+        
+        # If no matches found, try to infer time columns from data patterns
+        if not matching_cols:
+            matching_cols = self._infer_time_columns(ws, period)
         
         return list(set(matching_cols))
+    
+    def _infer_time_columns(self, ws, period: str) -> List[int]:
+        """Infer time columns when direct matching fails"""
+        matching_cols = []
+        
+        # Look for columns with numeric data that might represent time periods
+        for col in range(1, ws.max_column + 1):
+            numeric_count = 0
+            total_count = 0
+            
+            for row in range(1, min(21, ws.max_row + 1)):  # Check first 20 rows
+                cell = ws.cell(row, col)
+                if cell.value is not None:
+                    total_count += 1
+                    if isinstance(cell.value, (int, float)):
+                        numeric_count += 1
+            
+            # If column has mostly numeric data, it might be a time period
+            if total_count > 0 and numeric_count / total_count > 0.7:
+                # Check if the period matches any of the numeric values
+                for row in range(1, min(21, ws.max_row + 1)):
+                    cell = ws.cell(row, col)
+                    if cell.value and str(cell.value) == period:
+                        matching_cols.append(col)
+                        break
+        
+        return matching_cols
     
     def _extract_table_data(self, ws, table: TableStructure, query_components: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         """Extract data from a table structure"""
@@ -738,7 +911,32 @@ class IntelligentQueryProcessor:
         if text1_lower in text2_lower or text2_lower in text1_lower:
             return 0.8
         
-        # Word overlap
+        # Financial term variations
+        financial_variations = {
+            'gross profit': ['gross profit', 'gross margin', 'gross income'],
+            'net profit': ['net profit', 'net income', 'net earnings', 'net profit margin'],
+            'operating profit': ['operating profit', 'operating income', 'operating earnings'],
+            'revenue': ['revenue', 'sales', 'income', 'top line'],
+            'cost': ['cost', 'expense', 'costs', 'expenses'],
+            'labor': ['labor', 'labour', 'direct labor', 'direct labour', 'personnel'],
+            'shipping': ['shipping', 'freight', 'delivery', 'logistics'],
+            'advertising': ['advertising', 'advertising & marketing', 'marketing', 'promotion'],
+            'insurance': ['insurance', 'insurance expense', 'risk management'],
+            'ebitda': ['ebitda', 'ebit', 'operating profit'],
+            'fcf': ['fcf', 'free cash flow', 'cash flow', 'operating cash flow']
+        }
+        
+        # Check financial term variations
+        for base_term, variations in financial_variations.items():
+            if text1_lower in variations and text2_lower in variations:
+                return 0.9
+            elif text1_lower in variations or text2_lower in variations:
+                # Check if the other term is similar
+                for var in variations:
+                    if var in text1_lower or var in text2_lower:
+                        return 0.7
+        
+        # Word overlap with improved scoring
         words1 = set(text1_lower.split())
         words2 = set(text2_lower.split())
         
@@ -748,7 +946,16 @@ class IntelligentQueryProcessor:
         intersection = words1.intersection(words2)
         union = words1.union(words2)
         
-        return len(intersection) / len(union) if union else 0.0
+        base_score = len(intersection) / len(union) if union else 0.0
+        
+        # Bonus for partial matches
+        partial_bonus = 0.0
+        for word1 in words1:
+            for word2 in words2:
+                if word1 in word2 or word2 in word1:
+                    partial_bonus += 0.1
+        
+        return min(1.0, base_score + partial_bonus)
     
     def _format_response(self, query_components: Dict[str, Any], results: Dict[str, Any]) -> str:
         """Format the response based on query type and results"""
@@ -758,24 +965,35 @@ class IntelligentQueryProcessor:
         
         query_type = query_components['query_type']
         
+        # Add debug information for troubleshooting
+        debug_info = f"Debug: Found {len(results)} sheets with data"
+        for sheet_name, sheet_data in results.items():
+            debug_info += f", {sheet_name}: {len(sheet_data.get('data_points', []))} points, {len(sheet_data.get('tables', []))} tables"
+        
         if query_type == 'lookup':
-            return self._format_lookup_response(query_components, results)
+            response = self._format_lookup_response(query_components, results)
         elif query_type == 'percentage':
-            return self._format_percentage_response(query_components, results)
+            response = self._format_percentage_response(query_components, results)
         elif query_type == 'time_series':
-            return self._format_time_series_response(query_components, results)
+            response = self._format_time_series_response(query_components, results)
         elif query_type == 'forecast_series':
-            return self._format_forecast_series_response(query_components, results)
+            response = self._format_forecast_series_response(query_components, results)
         elif query_type == 'trend_analysis':
-            return self._format_trend_analysis_response(query_components, results)
+            response = self._format_trend_analysis_response(query_components, results)
         elif query_type == 'comparison':
-            return self._format_comparison_response(query_components, results)
+            response = self._format_comparison_response(query_components, results)
         elif query_type == 'analysis':
-            return self._format_analysis_response(query_components, results)
+            response = self._format_analysis_response(query_components, results)
         elif query_type == 'diagnostic':
-            return self._format_diagnostic_response(query_components, results)
+            response = self._format_diagnostic_response(query_components, results)
         else:
-            return self._format_general_response(query_components, results)
+            response = self._format_general_response(query_components, results)
+        
+        # If response is generic, add debug info
+        if any(phrase in response.lower() for phrase in ['could not', 'insufficient data', 'no data found']):
+            response += f"\n\n{debug_info}"
+        
+        return response
     
     def _format_lookup_response(self, query_components: Dict[str, Any], results: Dict[str, Any]) -> str:
         """Format response for simple lookup queries"""
@@ -1301,7 +1519,7 @@ if __name__ == "__main__":
         except KeyboardInterrupt:
             pass
         
-        print("\Analysis complete!")
+        print("Analysis complete!")
         
     except Exception as e:
         print(f"Error: {e}")
