@@ -1794,7 +1794,7 @@ class IntelligentQueryProcessor:
                     break
             
             forecast_cols = []
-            for col in range(1, min(30, ws.max_column + 1)):
+            for col in range(1, min(30, ws.max_column + 1):
                 header_cell = ws.cell(1, col)
                 if header_cell.value and isinstance(header_cell.value, str):
                     header_text = str(header_cell.value).lower()
