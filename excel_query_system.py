@@ -709,6 +709,39 @@ class IntelligentQueryProcessor:
         
         return extracted_data if (extracted_data['data_points'] or extracted_data['tables']) else None
     
+    def _find_relevant_data_fast(self, query_components: Dict[str, Any], start_time: float) -> Dict[str, Any]:
+        """Fast version of data finding with timeout protection"""
+        import time
+        
+        results = {}
+        max_processing_time = 10.0  # 10 second timeout
+        
+        # Find relevant sheets
+        relevant_sheets = self._find_relevant_sheets(query_components)
+        
+        # Process sheets with timeout protection
+        for sheet_name in relevant_sheets[:5]:  # Limit to first 5 sheets for speed
+            # Check timeout
+            if time.time() - start_time > max_processing_time:
+                logger.warning(f"Processing timeout reached after {time.time() - start_time:.2f} seconds")
+                break
+            
+            try:
+                sheet_data = self._extract_sheet_data(sheet_name, query_components)
+                if sheet_data:
+                    results[sheet_name] = sheet_data
+                    
+                    # Early exit if we have enough data
+                    total_data_points = sum(len(sd.get('data_points', [])) for sd in results.values())
+                    if total_data_points >= 10:  # Exit if we have 10+ data points
+                        break
+                        
+            except Exception as e:
+                logger.warning(f"Error processing sheet {sheet_name}: {e}")
+                continue
+        
+        return results
+    
     def _extract_data_fallback(self, ws, query_components: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         """Fallback method to extract data when normal methods fail"""
         fallback_data = {
@@ -777,51 +810,83 @@ class IntelligentQueryProcessor:
                         matching_rows.append(row)
                         break
         
-        # If no matches found with lower threshold, try fuzzy matching
+        # Quick fuzzy matching if no results - limited scope
         if not matching_rows:
-            for row in range(1, ws.max_row + 1):
-                for col in range(1, min(8, ws.max_column + 1)):
+            for row in range(1, min(30, max_search_rows + 1)):  # Only check first 30 rows
+                for col in range(1, min(6, ws.max_column + 1)):
                     cell = ws.cell(row, col)
                     if cell.value and isinstance(cell.value, str):
                         cell_text = str(cell.value).lower()
                         metric_lower = metric.lower()
                         
-                        # Check for partial matches
-                        if any(word in cell_text for word in metric_lower.split()):
+                        # Quick partial match check
+                        if any(word in cell_text for word in metric_lower.split()[:2]):  # Only check first 2 words
                             matching_rows.append(row)
                             break
         
         return matching_rows
     
     def _find_matching_columns(self, ws, period: str) -> List[int]:
-        """Find columns that match the time period"""
+        """Find columns that match the time period - PERFORMANCE OPTIMIZED"""
         matching_cols = []
         
-        # Check first few rows for column headers
-        for row in range(1, min(8, ws.max_row + 1)):  # Check more rows
-            for col in range(1, ws.max_column + 1):
+        # Limit search scope for performance - only check first 6 rows and first 30 columns
+        max_search_rows = min(6, ws.max_row)
+        max_search_cols = min(30, ws.max_column)
+        
+        for row in range(1, max_search_rows + 1):
+            for col in range(1, max_search_cols + 1):
                 cell = ws.cell(row, col)
                 if cell.value and isinstance(cell.value, str):
                     cell_text = str(cell.value).lower()
                     period_lower = period.lower()
                     
-                    # Direct match
+                    # Quick direct match
                     if period_lower in cell_text:
                         matching_cols.append(col)
-                    # Month abbreviations
+                    # Quick month/year check
                     elif any(month in cell_text for month in ['jan', 'feb', 'mar', 'apr', 'may', 'jun', 'jul', 'aug', 'sep', 'oct', 'nov', 'dec']):
                         if period_lower in ['2022', '2023', '2024'] or any(year in cell_text for year in ['2022', '2023', '2024']):
                             matching_cols.append(col)
-                    # Year patterns
                     elif any(year in cell_text for year in ['2020', '2021', '2022', '2023', '2024']):
                         if period_lower in cell_text:
                             matching_cols.append(col)
         
-        # If no matches found, try to infer time columns from data patterns
+        # Quick inference only if no matches found
         if not matching_cols:
-            matching_cols = self._infer_time_columns(ws, period)
+            matching_cols = self._infer_time_columns_fast(ws, period)
         
         return list(set(matching_cols))
+    
+    def _infer_time_columns_fast(self, ws, period: str) -> List[int]:
+        """Fast version of time column inference - PERFORMANCE OPTIMIZED"""
+        matching_cols = []
+        
+        # Only check first 20 rows and first 20 columns for speed
+        max_rows = min(20, ws.max_row)
+        max_cols = min(20, ws.max_column)
+        
+        for col in range(1, max_cols + 1):
+            numeric_count = 0
+            total_count = 0
+            
+            for row in range(1, max_rows + 1):
+                cell = ws.cell(row, col)
+                if cell.value is not None:
+                    total_count += 1
+                    if isinstance(cell.value, (int, float)):
+                        numeric_count += 1
+            
+            # Quick check - if column has mostly numeric data
+            if total_count > 0 and numeric_count / total_count > 0.6:  # Reduced threshold
+                # Quick period match check
+                for row in range(1, min(10, max_rows + 1)):  # Only check first 10 rows
+                    cell = ws.cell(row, col)
+                    if cell.value and str(cell.value) == period:
+                        matching_cols.append(col)
+                        break
+        
+        return matching_cols
     
     def _infer_time_columns(self, ws, period: str) -> List[int]:
         """Infer time columns when direct matching fails"""
@@ -1474,7 +1539,7 @@ if __name__ == "__main__":
         print(f"  - Financial categories: {len(stats['financial_categories'])}")
         
         # Process queries
-        print("\Processing test queries...")
+        print("Processing test queries...")
         print("=" * 60)
         
         successful_queries = 0
