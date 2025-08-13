@@ -330,7 +330,6 @@ class ExcelStructureAnalyzer:
                             table_type='simple_data'
                         )
                         tables.append(table)
-        
         return tables
     
     def _extract_table_from_header(self, all_cells: Dict[str, CellData], 
@@ -797,37 +796,63 @@ class IntelligentQueryProcessor:
         return fallback_data if fallback_data['data_points'] else None
     
     def _find_matching_rows(self, ws, metric: str) -> List[int]:
-        """Find rows that match the metric"""
+        """Find rows that match the metric - IMPROVED ACCURACY"""
         matching_rows = []
         
-        # Limit search scope for performance - only check first 50 rows
-        max_search_rows = min(50, ws.max_row)
+        # Limit search scope for performance - only check first 100 rows
+        max_search_rows = min(100, ws.max_row)
         
+        # First pass: exact and high similarity matches
         for row in range(1, max_search_rows + 1):
-            # Check first few columns for row labels
-            for col in range(1, min(6, ws.max_column + 1)):
+            for col in range(1, min(8, ws.max_column + 1)):
                 cell = ws.cell(row, col)
                 if cell.value and isinstance(cell.value, str):
-                    similarity = self._text_similarity(metric, cell.value)
-                    if similarity > 0.4:  # Lower threshold for better matching
+                    cell_text = str(cell.value).lower()
+                    metric_lower = metric.lower()
+                    
+                    # Exact match
+                    if metric_lower == cell_text:
                         matching_rows.append(row)
-                        break
+                        continue
+                    
+                    # High similarity match
+                    similarity = self._text_similarity(metric, cell.value)
+                    if similarity > 0.7:
+                        matching_rows.append(row)
+                        continue
+                    
+                    # Contains match for key terms
+                    if any(key_term in cell_text for key_term in metric_lower.split()):
+                        if len(metric_lower.split()) <= 2 or similarity > 0.5:
+                            matching_rows.append(row)
+                            continue
         
-        # Quick fuzzy matching if no results - limited scope
+        # Second pass: broader search for specific financial terms
         if not matching_rows:
-            for row in range(1, min(30, max_search_rows + 1)):  # Only check first 30 rows
-                for col in range(1, min(6, ws.max_column + 1)):
+            financial_terms = {
+                'direct labor': ['direct labor', 'direct labour', 'labor cost', 'labour cost', 'personnel cost'],
+                'indirect': ['indirect', 'overhead', 'indirect cost', 'indirect expense'],
+                'gross profit': ['gross profit', 'gross margin', 'gross income'],
+                'shipping income': ['shipping income', 'freight income', 'logistics income'],
+                'advertising': ['advertising', 'advertising & marketing', 'marketing', 'promotion'],
+                'insurance': ['insurance', 'insurance expense', 'risk management'],
+                'ebitda': ['ebitda', 'ebit', 'operating profit', 'operating income'],
+                'fcf': ['fcf', 'free cash flow', 'cash flow', 'operating cash flow']
+            }
+            
+            for row in range(1, max_search_rows + 1):
+                for col in range(1, min(8, ws.max_column + 1)):
                     cell = ws.cell(row, col)
                     if cell.value and isinstance(cell.value, str):
                         cell_text = str(cell.value).lower()
-                        metric_lower = metric.lower()
                         
-                        # Quick partial match check
-                        if any(word in cell_text for word in metric_lower.split()[:2]):  # Only check first 2 words
-                            matching_rows.append(row)
-                            break
+                        for search_term, variations in financial_terms.items():
+                            if any(var in cell_text for var in variations):
+                                if search_term in metric_lower or any(word in metric_lower for word in search_term.split()):
+                                    matching_rows.append(row)
+                                    break
         
-        return matching_rows
+        return list(set(matching_rows))  # Remove duplicates
     
     def _find_matching_columns(self, ws, period: str) -> List[int]:
         """Find columns that match the time period - PERFORMANCE OPTIMIZED"""
@@ -1101,43 +1126,81 @@ class IntelligentQueryProcessor:
         return "Data found but could not determine specific value"
     
     def _format_percentage_response(self, query_components: Dict[str, Any], results: Dict[str, Any]) -> str:
-        """Format response for percentage calculations"""
+        """Format response for percentage calculations - IMPROVED ACCURACY"""
         
-        # Extract numerator and denominator from the query and data
-        for sheet_name, sheet_data in results.items():
-            if not sheet_data['tables']:
-                continue
+        # Try multiple approaches to find percentage data
+        for approach in ['table_data', 'data_points', 'fallback']:
+            if approach == 'table_data':
+                # Approach 1: Use detected table structures
+                for sheet_name, sheet_data in results.items():
+                    if not sheet_data['tables']:
+                        continue
+                    
+                    for table_data in sheet_data['tables']:
+                        percentage_result = self._calculate_percentage_from_table(table_data, query_components)
+                        if percentage_result:
+                            return percentage_result
             
-            table_data = sheet_data['tables'][0]
+            elif approach == 'data_points':
+                # Approach 2: Use extracted data points
+                for sheet_name, sheet_data in results.items():
+                    if not sheet_data['data_points']:
+                        continue
+                    
+                    percentage_result = self._calculate_percentage_from_data_points(sheet_data['data_points'], query_components)
+                    if percentage_result:
+                        return percentage_result
             
-            # Find rows that match the numerator (e.g., "indirect")
+            elif approach == 'fallback':
+                # Approach 3: Fallback to sheet scanning
+                for sheet_name, sheet_data in results.items():
+                    ws = self.wb[sheet_name]
+                    percentage_result = self._calculate_percentage_fallback(ws, query_components)
+                    if percentage_result:
+                        return percentage_result
+        
+        return "Could not calculate percentage - insufficient data"
+    
+    def _calculate_percentage_from_table(self, table_data: Dict[str, Any], query_components: Dict[str, Any]) -> Optional[str]:
+        """Calculate percentage from table structure"""
+        try:
+            # Find numerator and denominator rows
             numerator_rows = []
             denominator_rows = []
             
             for row, label in table_data['row_labels'].items():
+                label_lower = label.lower()
+                
+                # Look for numerator (e.g., "indirect", "insurance")
                 for metric in query_components['metrics']:
-                    if 'indirect' in metric and 'indirect' in label.lower():
+                    if any(term in label_lower for term in ['indirect', 'overhead', 'insurance']):
                         numerator_rows.append(row)
-                    elif any(term in label.lower() for term in ['cost', 'expense']) and 'income' not in label.lower():
+                        break
+                
+                # Look for denominator (e.g., "cost", "expense", "operating expense")
+                if any(term in label_lower for term in ['cost', 'expense', 'operating expense', 'total expense']):
+                    if 'income' not in label_lower and 'revenue' not in label_lower:
                         denominator_rows.append(row)
             
             if not numerator_rows or not denominator_rows:
-                continue
+                return None
             
-            # Calculate percentages for available time periods
+            # Calculate percentages for each time period
             time_period_results = {}
             
             for col, col_label in table_data['headers'].items():
-                numerator_total = sum(table_data['data'].get((row, col), 0) for row in numerator_rows)
-                denominator_total = sum(abs(table_data['data'].get((row, col), 0)) for row in denominator_rows)
-                
-                if denominator_total > 0 and numerator_total > 0:
-                    percentage = (abs(numerator_total) / denominator_total) * 100
-                    time_period_results[col_label] = percentage
+                try:
+                    numerator_total = sum(abs(table_data['data'].get((row, col), 0)) for row in numerator_rows)
+                    denominator_total = sum(abs(table_data['data'].get((row, col), 0)) for row in denominator_rows)
+                    
+                    if denominator_total > 0 and numerator_total > 0:
+                        percentage = (numerator_total / denominator_total) * 100
+                        time_period_results[col_label] = percentage
+                except (TypeError, ValueError):
+                    continue
             
             if time_period_results:
                 if len(time_period_results) == 1:
-                    # Single period result
                     period, percentage = list(time_period_results.items())[0]
                     return f"{percentage:.1f}% in {period}"
                 else:
@@ -1147,72 +1210,352 @@ class IntelligentQueryProcessor:
                     
                     result = f"Average: {average:.1f}%. Highest: {highest[1]:.1f}% in {highest[0]}"
                     return result
+            
+        except Exception as e:
+            logger.warning(f"Error calculating percentage from table: {e}")
         
-        return "Could not calculate percentage - insufficient data"
+        return None
+    
+    def _calculate_percentage_from_data_points(self, data_points: List[Dict[str, Any]], query_components: Dict[str, Any]) -> Optional[str]:
+        """Calculate percentage from extracted data points"""
+        try:
+            # Group data points by time period
+            period_data = {}
+            
+            for dp in data_points:
+                period = dp.get('col_label', 'Unknown')
+                if period not in period_data:
+                    period_data[period] = []
+                period_data[period].append(dp)
+            
+            # Calculate percentages for each period
+            period_percentages = {}
+            
+            for period, points in period_data.items():
+                numerator_total = 0
+                denominator_total = 0
+                
+                for dp in points:
+                    value = abs(dp.get('value', 0))
+                    label = dp.get('row_label', '').lower()
+                    
+                    # Categorize as numerator or denominator
+                    if any(term in label for term in ['indirect', 'overhead', 'insurance']):
+                        numerator_total += value
+                    elif any(term in label for term in ['cost', 'expense']):
+                        denominator_total += value
+                
+                if denominator_total > 0 and numerator_total > 0:
+                    percentage = (numerator_total / denominator_total) * 100
+                    period_percentages[period] = percentage
+            
+            if period_percentages:
+                if len(period_percentages) == 1:
+                    period, percentage = list(period_percentages.items())[0]
+                    return f"{percentage:.1f}% in {period}"
+                else:
+                    highest = max(period_percentages.items(), key=lambda x: x[1])
+                    average = sum(period_percentages.values()) / len(period_percentages)
+                    return f"Average: {average:.1f}%. Highest: {highest[1]:.1f}% in {highest[0]}"
+            
+        except Exception as e:
+            logger.warning(f"Error calculating percentage from data points: {e}")
+        
+        return None
+    
+    def _calculate_percentage_fallback(self, ws, query_components: Dict[str, Any]) -> Optional[str]:
+        """Fallback percentage calculation by scanning sheet"""
+        try:
+            # Scan for relevant rows
+            numerator_rows = []
+            denominator_rows = []
+            
+            for row in range(1, min(100, ws.max_row + 1)):
+                for col in range(1, min(8, ws.max_column + 1)):
+                    cell = ws.cell(row, col)
+                    if cell.value and isinstance(cell.value, str):
+                        cell_text = str(cell.value).lower()
+                        
+                        # Check for numerator terms
+                        if any(term in cell_text for term in ['indirect', 'overhead', 'insurance']):
+                            numerator_rows.append(row)
+                        
+                        # Check for denominator terms
+                        if any(term in cell_text for term in ['cost', 'expense', 'operating expense']):
+                            if 'income' not in cell_text and 'revenue' not in cell_text:
+                                denominator_rows.append(row)
+            
+            if not numerator_rows or not denominator_rows:
+                return None
+            
+            # Calculate percentages for available columns
+            percentages = {}
+            
+            for col in range(1, min(20, ws.max_column + 1)):
+                try:
+                    numerator_total = sum(abs(ws.cell(row, col).value or 0) for row in numerator_rows)
+                    denominator_total = sum(abs(ws.cell(row, col).value or 0) for row in denominator_rows)
+                    
+                    if denominator_total > 0 and numerator_total > 0:
+                        percentage = (numerator_total / denominator_total) * 100
+                        percentages[col] = percentage
+                except (TypeError, ValueError):
+                    continue
+            
+            if percentages:
+                # Return the first valid percentage found
+                col, percentage = list(percentages.items())[0]
+                return f"{percentage:.1f}%"
+            
+        except Exception as e:
+            logger.warning(f"Error in percentage fallback calculation: {e}")
+        
+        return None
     
     def _format_time_series_response(self, query_components: Dict[str, Any], results: Dict[str, Any]) -> str:
-        """Format response for time series queries"""
+        """Format response for time series queries - IMPROVED ACCURACY"""
         
-        for sheet_name, sheet_data in results.items():
-            if not sheet_data['tables']:
-                continue
+        # Try multiple approaches to find time series data
+        for approach in ['table_data', 'data_points', 'sheet_scan']:
+            if approach == 'table_data':
+                # Approach 1: Use detected table structures
+                for sheet_name, sheet_data in results.items():
+                    if not sheet_data['tables']:
+                        continue
+                    
+                    for table_data in sheet_data['tables']:
+                        time_series_result = self._extract_time_series_from_table(table_data, query_components)
+                        if time_series_result:
+                            return time_series_result
             
-            table_data = sheet_data['tables'][0]
+            elif approach == 'data_points':
+                # Approach 2: Use extracted data points
+                for sheet_name, sheet_data in results.items():
+                    if not sheet_data['data_points']:
+                        continue
+                    
+                    time_series_result = self._extract_time_series_from_data_points(sheet_data['data_points'], query_components)
+                    if time_series_result:
+                        return time_series_result
             
+            elif approach == 'sheet_scan':
+                # Approach 3: Direct sheet scanning
+                for sheet_name, sheet_data in results.items():
+                    ws = self.wb[sheet_name]
+                    time_series_result = self._extract_time_series_from_sheet(ws, query_components)
+                    if time_series_result:
+                        return time_series_result
+        
+        return "Could not extract time series data"
+    
+    def _extract_time_series_from_table(self, table_data: Dict[str, Any], query_components: Dict[str, Any]) -> Optional[str]:
+        """Extract time series from table structure"""
+        try:
             # Find relevant rows for the metric
             relevant_rows = []
             for row, label in table_data['row_labels'].items():
+                label_lower = label.lower()
+                
+                # Check for exact metric matches
                 for metric in query_components['metrics']:
-                    if self._text_similarity(metric, label) > 0.5:
+                    metric_lower = metric.lower()
+                    
+                    # Direct match
+                    if metric_lower == label_lower:
                         relevant_rows.append((row, label))
+                        break
+                    
+                    # High similarity match
+                    if self._text_similarity(metric, label) > 0.7:
+                        relevant_rows.append((row, label))
+                        break
+                    
+                    # Contains match for key terms
+                    if any(term in label_lower for term in metric_lower.split()):
+                        relevant_rows.append((row, label))
+                        break
             
             if not relevant_rows:
-                continue
+                return None
             
             # Extract time series data
             time_series = {}
             
             for col, col_label in table_data['headers'].items():
-                # Check if this column represents a time period we're interested in
-                is_relevant_period = False
-                if query_components['time_periods']:
-                    for period in query_components['time_periods']:
-                        if period.lower() in col_label.lower():
-                            is_relevant_period = True
-                            break
-                else:
-                    # If no specific periods mentioned, include all time-looking columns
-                    if any(pattern in col_label.lower() for pattern in ['jan', 'feb', 'mar', 'apr', 'may', 'jun',
-                                                                       'jul', 'aug', 'sep', 'oct', 'nov', 'dec',
-                                                                       '2020', '2021', '2022', '2023', '2024']):
-                        is_relevant_period = True
+                # Check if this column represents a time period
+                is_relevant_period = self._is_time_period_column(col_label, query_components)
                 
                 if is_relevant_period:
                     total_value = 0
                     for row, label in relevant_rows:
                         value = table_data['data'].get((row, col), 0)
-                        total_value += abs(value) if value else 0
+                        if value and isinstance(value, (int, float)):
+                            total_value += abs(value)
                     
                     if total_value > 0:
                         time_series[col_label] = total_value
             
             if time_series:
-                # Format the response
-                company = query_components['companies'][0] if query_components['companies'] else "Company"
-                metric = query_components['metrics'][0] if query_components['metrics'] else "metric"
-                
-                result_lines = [f"{company} {metric} time series:"]
-                
-                # Sort by time if possible
-                sorted_periods = sorted(time_series.items())
-                
-                for period, value in sorted_periods:
-                    formatted_value = self._format_financial_value(value)
-                    result_lines.append(f"  {period}: {formatted_value}")
-                
-                return "\n".join(result_lines)
+                return self._format_time_series_output(time_series, query_components)
+            
+        except Exception as e:
+            logger.warning(f"Error extracting time series from table: {e}")
         
-        return "Could not extract time series data"
+        return None
+    
+    def _extract_time_series_from_data_points(self, data_points: List[Dict[str, Any]], query_components: Dict[str, Any]) -> Optional[str]:
+        """Extract time series from data points"""
+        try:
+            # Group by time period and metric
+            period_data = {}
+            
+            for dp in data_points:
+                period = dp.get('col_label', 'Unknown')
+                if period not in period_data:
+                    period_data[period] = []
+                period_data[period].append(dp)
+            
+            # Check if we have time series data
+            if len(period_data) >= 2:  # Need at least 2 time periods
+                time_series = {}
+                
+                for period, points in period_data.items():
+                    # Check if this period is relevant
+                    if self._is_time_period_column(period, query_components):
+                        total_value = sum(abs(dp.get('value', 0)) for dp in points)
+                        if total_value > 0:
+                            time_series[period] = total_value
+                
+                if time_series:
+                    return self._format_time_series_output(time_series, query_components)
+            
+        except Exception as e:
+            logger.warning(f"Error extracting time series from data points: {e}")
+        
+        return None
+    
+    def _extract_time_series_from_sheet(self, ws, query_components: Dict[str, Any]) -> Optional[str]:
+        """Extract time series by scanning sheet directly"""
+        try:
+            # Find metric rows
+            metric_rows = []
+            for row in range(1, min(100, ws.max_row + 1)):
+                for col in range(1, min(8, ws.max_column + 1)):
+                    cell = ws.cell(row, col)
+                    if cell.value and isinstance(cell.value, str):
+                        for metric in query_components['metrics']:
+                            if self._text_similarity(metric, str(cell.value)) > 0.6:
+                                metric_rows.append(row)
+                                break
+            
+            if not metric_rows:
+                return None
+            
+            # Find time period columns
+            time_columns = []
+            for col in range(1, min(30, ws.max_column + 1)):
+                header_cell = ws.cell(1, col)
+                if header_cell.value and isinstance(header_cell.value, str):
+                    if self._is_time_period_column(str(header_cell.value), query_components):
+                        time_columns.append(col)
+            
+            if not time_columns:
+                return None
+            
+            # Extract time series data
+            time_series = {}
+            
+            for col in time_columns:
+                col_label = ws.cell(1, col).value
+                total_value = 0
+                
+                for row in metric_rows:
+                    cell = ws.cell(row, col)
+                    if cell.value and isinstance(cell.value, (int, float)):
+                        total_value += abs(cell.value)
+                
+                if total_value > 0:
+                    time_series[col_label] = total_value
+            
+            if time_series:
+                return self._format_time_series_output(time_series, query_components)
+            
+        except Exception as e:
+            logger.warning(f"Error extracting time series from sheet: {e}")
+        
+        return None
+    
+    def _is_time_period_column(self, col_label: str, query_components: Dict[str, Any]) -> bool:
+        """Check if a column represents a time period"""
+        if not col_label:
+            return False
+        
+        label_lower = col_label.lower()
+        
+        # Check for specific periods mentioned in query
+        if query_components['time_periods']:
+            for period in query_components['time_periods']:
+                if period.lower() in label_lower:
+                    return True
+        
+        # Check for common time patterns
+        time_patterns = [
+            'jan', 'feb', 'mar', 'apr', 'may', 'jun',
+            'jul', 'aug', 'sep', 'oct', 'nov', 'dec',
+            '2020', '2021', '2022', '2023', '2024',
+            'q1', 'q2', 'q3', 'q4', 'quarter'
+        ]
+        
+        return any(pattern in label_lower for pattern in time_patterns)
+    
+    def _format_time_series_output(self, time_series: Dict[str, float], query_components: Dict[str, Any]) -> str:
+        """Format time series output"""
+        if not time_series:
+            return "No time series data found"
+        
+        # Get company and metric names
+        company = query_components['companies'][0] if query_components['companies'] else "Company"
+        metric = query_components['metrics'][0] if query_components['metrics'] else "metric"
+        
+        result_lines = [f"{company} {metric} time series:"]
+        
+        # Sort by time if possible
+        try:
+            sorted_periods = sorted(time_series.items(), key=lambda x: self._extract_time_order(x[0]))
+        except:
+            sorted_periods = sorted(time_series.items())
+        
+        for period, value in sorted_periods:
+            formatted_value = self._format_financial_value(value)
+            result_lines.append(f"  {period}: {formatted_value}")
+        
+        return "\n".join(result_lines)
+    
+    def _extract_time_order(self, period: str) -> int:
+        """Extract numeric order from time period for sorting"""
+        period_lower = period.lower()
+        
+        # Month order
+        month_order = {
+            'jan': 1, 'feb': 2, 'mar': 3, 'apr': 4, 'may': 5, 'jun': 6,
+            'jul': 7, 'aug': 8, 'sep': 9, 'oct': 10, 'nov': 11, 'dec': 12
+        }
+        
+        for month, order in month_order.items():
+            if month in period_lower:
+                return order
+        
+        # Year order
+        year_match = re.search(r'20\d{2}', period)
+        if year_match:
+            return int(year_match.group())
+        
+        # Quarter order
+        quarter_match = re.search(r'q([1-4])', period_lower)
+        if quarter_match:
+            return int(quarter_match.group(1))
+        
+        return 0  # Default order
     
     def _format_forecast_series_response(self, query_components: Dict[str, Any], results: Dict[str, Any]) -> str:
         """Format response for forecast series queries"""
