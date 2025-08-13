@@ -629,25 +629,65 @@ class IntelligentQueryProcessor:
         return results
     
     def _find_relevant_sheets(self, query_components: Dict[str, Any]) -> List[str]:
-        """Find sheets relevant to the query"""
+        """Find sheets relevant to the query - IMPROVED COMPANY MATCHING"""
         relevant_sheets = []
         
-        # Direct company matching
+        # Enhanced company matching with variations
+        company_variations = {
+            'mxd': ['mxd', 'mxd p&l', 'mxd bs'],
+            'branch': ['branch', 'brnch', 'branch p&l', 'branch bs'],
+            'hec': ['hec', 'hec financials', 'hec p&l', 'hec bs'],
+            'all': ['all', 'all statements', 'consolidated', 'monthly summary']
+        }
+        
+        # Direct company matching with priority
         for company in query_components['companies']:
+            company_lower = company.lower()
+            
+            # Check for exact matches first
             for sheet_name in self.workbook_analysis.sheets.keys():
-                if company.lower() in sheet_name.lower():
+                sheet_lower = sheet_name.lower()
+                
+                # Exact company match
+                if company_lower in sheet_lower:
                     relevant_sheets.append(sheet_name)
-        
-        # Metric-based sheet selection
-        for metric in query_components['metrics']:
-            for sheet_name, sheet_analysis in self.workbook_analysis.sheets.items():
-                categories = self.taxonomy.categorize_text(metric)
-                for category in categories:
-                    if category in sheet_analysis.financial_accounts:
-                        if sheet_name not in relevant_sheets:
+                    continue
+                
+                # Check company variations
+                for company_name, variations in company_variations.items():
+                    if company_name in company_lower:
+                        if any(var in sheet_lower for var in variations):
                             relevant_sheets.append(sheet_name)
+                            break
         
-        # If no specific sheets found, include major financial statements
+        # Remove duplicates and prioritize company-specific sheets
+        relevant_sheets = list(set(relevant_sheets))
+        
+        # If no company-specific sheets found, try broader matching
+        if not relevant_sheets:
+            for company in query_components['companies']:
+                company_lower = company.lower()
+                for sheet_name in self.workbook_analysis.sheets.keys():
+                    sheet_lower = sheet_name.lower()
+                    
+                    # Check if sheet contains company name or abbreviation
+                    if (company_lower in sheet_lower or 
+                        any(word in sheet_lower for word in company_lower.split()) or
+                        any(abbr in sheet_lower for abbr in company_lower[:3])):
+                        relevant_sheets.append(sheet_name)
+        
+        # Metric-based sheet selection (only if we have company matches)
+        if relevant_sheets:
+            for metric in query_components['metrics']:
+                for sheet_name, sheet_analysis in self.workbook_analysis.sheets.items():
+                    if sheet_name in relevant_sheets:  # Only check relevant company sheets
+                        categories = self.taxonomy.categorize_text(metric)
+                        for category in categories:
+                            if category in sheet_analysis.financial_accounts:
+                                if sheet_name not in relevant_sheets:
+                                    relevant_sheets.append(sheet_name)
+        
+        # If still no specific sheets found, include major financial statements
         if not relevant_sheets:
             for sheet_name, sheet_analysis in self.workbook_analysis.sheets.items():
                 if sheet_analysis.sheet_type in ['income_statement', 'balance_sheet', 'summary']:
@@ -984,12 +1024,57 @@ class IntelligentQueryProcessor:
         return f"Row {row}"
     
     def _get_column_label(self, ws, col: int) -> str:
-        """Get the label for a column"""
+        """Get the label for a column - IMPROVED TIME PERIOD DETECTION"""
         for row in range(1, min(6, ws.max_row + 1)):
             cell = ws.cell(row, col)
             if cell.value and isinstance(cell.value, str):
-                return str(cell.value)
+                cell_text = str(cell.value).strip()
+                
+                # Validate that this looks like a time period
+                if self._is_valid_time_period_label(cell_text):
+                    return cell_text
+        
+        # If no valid time period found, try to find one in nearby cells
+        for row in range(1, min(10, ws.max_row + 1)):
+            cell = ws.cell(row, col)
+            if cell.value and isinstance(cell.value, str):
+                cell_text = str(cell.value).strip()
+                if self._is_valid_time_period_label(cell_text):
+                    return cell_text
+        
         return f"Column {col}"
+    
+    def _is_valid_time_period_label(self, label: str) -> bool:
+        """Check if a label looks like a valid time period"""
+        if not label:
+            return False
+        
+        label_lower = label.lower()
+        
+        # Valid time period patterns
+        time_patterns = [
+            # Years
+            r'20\d{2}',  # 2020, 2021, 2022, 2023, 2024
+            # Months
+            r'jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec',
+            # Quarters
+            r'q[1-4]|quarter [1-4]',
+            # Full month names
+            r'january|february|march|april|may|june|july|august|september|october|november|december',
+            # Time indicators
+            r'forecast|budget|plan|actual|ytd|mtd'
+        ]
+        
+        import re
+        for pattern in time_patterns:
+            if re.search(pattern, label_lower):
+                return True
+        
+        # Check for numeric values that might be years
+        if re.match(r'^\d{4}$', label):
+            return True
+        
+        return False
     
     def _text_similarity(self, text1: str, text2: str) -> float:
         """Calculate similarity between two text strings"""
@@ -1162,7 +1247,7 @@ class IntelligentQueryProcessor:
         return "Could not calculate percentage - insufficient data"
     
     def _calculate_percentage_from_table(self, table_data: Dict[str, Any], query_components: Dict[str, Any]) -> Optional[str]:
-        """Calculate percentage from table structure"""
+        """Calculate percentage from table structure - IMPROVED ACCURACY"""
         try:
             # Find numerator and denominator rows
             numerator_rows = []
@@ -1185,7 +1270,7 @@ class IntelligentQueryProcessor:
             if not numerator_rows or not denominator_rows:
                 return None
             
-            # Calculate percentages for each time period
+            # Calculate percentages for each time period with validation
             time_period_results = {}
             
             for col, col_label in table_data['headers'].items():
@@ -1195,21 +1280,52 @@ class IntelligentQueryProcessor:
                     
                     if denominator_total > 0 and numerator_total > 0:
                         percentage = (numerator_total / denominator_total) * 100
-                        time_period_results[col_label] = percentage
+                        
+                        # Validate percentage is reasonable (0-100%)
+                        if 0 <= percentage <= 100:
+                            time_period_results[col_label] = percentage
+                        elif 0 <= percentage <= 200:  # Allow up to 200% for special cases
+                            time_period_results[col_label] = percentage
                 except (TypeError, ValueError):
                     continue
             
             if time_period_results:
-                if len(time_period_results) == 1:
-                    period, percentage = list(time_period_results.items())[0]
-                    return f"{percentage:.1f}% in {period}"
-                else:
-                    # Multiple periods - find highest and calculate average
-                    highest = max(time_period_results.items(), key=lambda x: x[1])
-                    average = sum(time_period_results.values()) / len(time_period_results)
+                # Filter out unreasonable percentages and invalid time periods
+                valid_percentages = {}
+                for period, percentage in time_period_results.items():
+                    # Check if period looks like a valid time period
+                    if self._is_valid_time_period_label(str(period)):
+                        if 0 <= percentage <= 100:
+                            valid_percentages[period] = percentage
+                        elif 0 <= percentage <= 200:  # Allow up to 200% for special cases
+                            valid_percentages[period] = percentage
+                
+                if valid_percentages:
+                    # Filter to reasonable percentages first
+                    reasonable_percentages = {k: v for k, v in valid_percentages.items() if 0 <= v <= 100}
                     
-                    result = f"Average: {average:.1f}%. Highest: {highest[1]:.1f}% in {highest[0]}"
-                    return result
+                    if reasonable_percentages:
+                        if len(reasonable_percentages) == 1:
+                            period, percentage = list(reasonable_percentages.items())[0]
+                            return f"{percentage:.1f}% in {period}"
+                        else:
+                            # Multiple periods - find highest and calculate average
+                            highest = max(reasonable_percentages.items(), key=lambda x: x[1])
+                            average = sum(reasonable_percentages.values()) / len(reasonable_percentages)
+                            
+                            result = f"Average: {average:.1f}%. Highest: {highest[1]:.1f}% in {highest[0]}"
+                            return result
+                    elif valid_percentages:
+                        # If only unreasonable percentages exist, return the lowest one
+                        lowest = min(valid_percentages.items(), key=lambda x: x[1])
+                        return f"{lowest[1]:.1f}% in {lowest[0]} (note: unusually high percentage)"
+                
+                # If no valid time periods found, try to find any reasonable percentage
+                if time_period_results:
+                    reasonable_values = {k: v for k, v in time_period_results.items() if 0 <= v <= 100}
+                    if reasonable_values:
+                        period, percentage = list(reasonable_values.items())[0]
+                        return f"{percentage:.1f}% (time period unclear)"
             
         except Exception as e:
             logger.warning(f"Error calculating percentage from table: {e}")
@@ -1521,20 +1637,23 @@ class IntelligentQueryProcessor:
                 
                 # Exact year match (e.g., "2024" should match "2024" not "2021")
                 if re.match(r'20\d{2}', period_lower):
-                    if period_lower in label_lower and not any(other_year in label_lower for other_year in ['2020', '2021', '2022', '2023', '2024'] if other_year != period_lower):
-                        return True
+                    if period_lower in label_lower:
+                        # Check for conflicting years
+                        conflicting_years = [year for year in ['2020', '2021', '2022', '2023', '2024'] if year in label_lower and year != period_lower]
+                        if not conflicting_years:
+                            return True
                 
-                # Month match
+                # Month match - prioritize months for the requested year
                 elif period_lower in ['jan', 'feb', 'mar', 'apr', 'may', 'jun', 'jul', 'aug', 'sep', 'oct', 'nov', 'dec']:
                     if period_lower in label_lower:
                         # Check if this month is associated with the right year
-                        if query_components['time_periods']:
-                            for time_period in query_components['time_periods']:
-                                if re.match(r'20\d{2}', time_period):
-                                    if time_period in label_lower:
-                                        return True
-                        else:
-                            return True
+                        for time_period in query_components['time_periods']:
+                            if re.match(r'20\d{2}', time_period):
+                                if time_period in label_lower:
+                                    return True
+                                # If no year specified in column, but month matches and no conflicting years
+                                elif not any(year in label_lower for year in ['2020', '2021', '2022', '2023', '2024']):
+                                    return True
         
         # If no specific periods in query, be more selective about time columns
         if not query_components['time_periods']:
@@ -1679,23 +1798,24 @@ class IntelligentQueryProcessor:
             for col, col_label in table_data['headers'].items():
                 col_label_lower = col_label.lower()
                 
-                # Priority 1: Exact year match
+                # Priority 1: Month columns for the exact requested year (highest priority)
                 if requested_year and requested_year in col_label_lower:
-                    forecast_cols.append((col, col_label, 1))  # Priority 1
+                    if any(month in col_label_lower for month in ['jan', 'feb', 'mar', 'apr', 'may', 'jun', 'jul', 'aug', 'sep', 'oct', 'nov', 'dec']):
+                        forecast_cols.append((col, col_label, 1))  # Priority 1 - Monthly data for requested year
+                    else:
+                        forecast_cols.append((col, col_label, 2))  # Priority 2 - Annual data for requested year
                 
-                # Priority 2: Forecast/budget indicators for the right year
+                # Priority 3: Forecast/budget indicators for the right year
                 elif any(term in col_label_lower for term in ['forecast', 'budget', 'plan']):
                     if requested_year and requested_year in col_label_lower:
-                        forecast_cols.append((col, col_label, 1))  # Priority 1
-                    else:
-                        forecast_cols.append((col, col_label, 2))  # Priority 2
-                
-                # Priority 3: Month columns for the right year
-                elif any(month in col_label_lower for month in ['jan', 'feb', 'mar', 'apr', 'may', 'jun', 'jul', 'aug', 'sep', 'oct', 'nov', 'dec']):
-                    if requested_year and requested_year in col_label_lower:
-                        forecast_cols.append((col, col_label, 1))  # Priority 1
-                    else:
                         forecast_cols.append((col, col_label, 3))  # Priority 3
+                
+                # Priority 4: Month columns that might be for the requested year
+                elif any(month in col_label_lower for month in ['jan', 'feb', 'mar', 'apr', 'may', 'jun', 'jul', 'aug', 'sep', 'oct', 'nov', 'dec']):
+                    # Check if this might be for the requested year (no conflicting year)
+                    conflicting_years = [year for year in ['2020', '2021', '2022', '2023', '2024'] if year in col_label_lower and year != requested_year]
+                    if not conflicting_years:
+                        forecast_cols.append((col, col_label, 4))  # Priority 4 - Potential monthly data
             
             if not forecast_cols:
                 return None
@@ -2188,7 +2308,7 @@ if __name__ == "__main__":
             pass
         
         print("Analysis complete!")
-        
+
     except Exception as e:
         print(f"Error: {e}")
         logger.error(f"System error: {e}")
