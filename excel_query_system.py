@@ -800,9 +800,12 @@ class IntelligentQueryProcessor:
         """Find rows that match the metric"""
         matching_rows = []
         
-        for row in range(1, ws.max_row + 1):
+        # Limit search scope for performance - only check first 50 rows
+        max_search_rows = min(50, ws.max_row)
+        
+        for row in range(1, max_search_rows + 1):
             # Check first few columns for row labels
-            for col in range(1, min(8, ws.max_column + 1)):  # Check more columns
+            for col in range(1, min(6, ws.max_column + 1)):
                 cell = ws.cell(row, col)
                 if cell.value and isinstance(cell.value, str):
                     similarity = self._text_similarity(metric, cell.value)
